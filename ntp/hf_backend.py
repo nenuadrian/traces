@@ -93,15 +93,15 @@ def train_hf(args):
 
     train_data = hf_tokenize(load_train_examples(args), tok)
     val_data = hf_tokenize(load_examples(os.path.join(args.data, "val.jsonl")), tok)
+    max_tok = max(len(d[0]) for d in train_data)
     print("device=%s model=%s params=%.0fM trainable=%.1fM train_ex=%d max_tok=%d"
           % (device, args.hf_model, n_param / 1e6, n_train / 1e6, len(train_data),
-             max(len(i) for i, _ in train_data)), flush=True)
+             max_tok), flush=True)
 
     run = wb.init_run("train", wb.tag_from_out(args.out), dict(
         vars(args), backend="hf", device=device, n_params=n_param,
         n_trainable=n_train, train_examples=len(train_data),
-        val_examples=len(val_data),
-        max_tokens=max(len(i) for i, _ in train_data),
+        val_examples=len(val_data), max_tokens=max_tok,
         **wb.data_meta(args.data)), enabled=not args.no_wandb)
 
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
