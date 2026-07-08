@@ -36,12 +36,26 @@ def _encode_prompt(tok, prompt: str) -> List[int]:
     return ids
 
 
-def hf_tokenize(examples: List[dict], tok) -> List[Tuple[List[int], int]]:
+def hf_tokenize(examples: List[dict], tok) -> List[Tuple[List[int], int, int]]:
+    """Returns (full_ids, prompt_len, weight_start) per example.
+
+    The target is tokenized in two parts split at its <DELTA>/<PARAMS> block so the
+    parameter-update tokens form their own region; weight_start is the absolute index
+    of that region (used by --delta-token-weight to upweight magnitude digits).
+    """
     data = []
     for ex in examples:
         p = _encode_prompt(tok, ex["prompt"])
-        t = tok(ex["target"], add_special_tokens=False).input_ids + [tok.eos_token_id]
-        data.append((p + t, len(p)))
+        tgt = ex["target"]
+        mark = "<DELTA>" if "<DELTA>" in tgt else ("<PARAMS>" if "<PARAMS>" in tgt else None)
+        if mark:
+            i = tgt.index(mark)
+            t1 = tok(tgt[:i], add_special_tokens=False).input_ids
+            t2 = tok(tgt[i:], add_special_tokens=False).input_ids + [tok.eos_token_id]
+            data.append((p + t1 + t2, len(p), len(p) + len(t1)))
+        else:
+            t = tok(tgt, add_special_tokens=False).input_ids + [tok.eos_token_id]
+            data.append((p + t, len(p), len(p) + len(t)))
     return data
 
 
@@ -114,8 +128,19 @@ def train_hf(args):
             x, y = collate(batch, pad)
             x, y = x.to(device), y.to(device)
             logits = model(input_ids=x, attention_mask=(x != pad).long()).logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1),
-                                   ignore_index=-100)
+            dtw = getattr(args, "delta_token_weight", 1.0)
+            if dtw != 1.0:
+                w = torch.ones_like(y, dtype=torch.float)
+                for i, item in enumerate(batch):
+                    if len(item) > 2:  # weight region begins at label index ws-1
+                        w[i, max(0, item[2] - 1):] = dtw
+                w[y == -100] = 0.0
+                ce = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1),
+                                     ignore_index=-100, reduction="none").view_as(w)
+                loss = (ce * w).sum() / w.sum().clamp(min=1.0)
+            else:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1),
+                                       ignore_index=-100)
             (loss / args.accum).backward()
             loss_acc += loss.item()
             loss_n += 1

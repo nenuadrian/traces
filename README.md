@@ -76,9 +76,9 @@ well-defined and iterable.
 # 1. safe plumbing check — CPU only, ~2 min, no downloads
 bash scripts/smoke_cpu.sh
 
-# 2. real run, current recipe (v4) — COMPUTE-HEAVY, meant for a CUDA machine
-bash scripts/train_v4.sh          # delta targets + true DAgger + batched 12-round inference
-# MODEL=HuggingFaceTB/SmolLM2-360M NAME=v4_smol360 bash scripts/train_v4.sh
+# 2. real run, current recipe (v5) — COMPUTE-HEAVY, meant for a CUDA machine
+bash scripts/train_v5.sh          # magnitude-weighted delta loss + rebalanced rounds + DAgger
+# MODEL=Qwen/Qwen2.5-1.5B LORA=1 GRADCKPT=1 NAME=v5_qwen15 BS=4 ACCUM=2 bash scripts/train_v5.sh
 
 # alternatives: v1 Mac-safe recipe / other variants (LoRA, gated Llama-3.2-1B, scratch)
 bash scripts/train_smol135.sh
@@ -197,7 +197,14 @@ Everything else (executor, serialization, training, inference, evaluation) is ge
   show the residual failure precisely: descent frac 0.80 but progress-vs-SGD 0.17 — a
   *reliable but ~6×-too-timid* optimizer that nails the coarse-geometry phase (round-1
   ARI jump) and plateaus in the confidence-sharpening phase.
-- **v4** (current): `<DELTA>` targets (kill the copy bias behind the timid updates),
-  true DAgger corrections at model-visited states, multi-scale jitter, 8-round data,
-  batched 12-round inference — `scripts/train_v4.sh` (two-phase). Not yet run.
+- **v4 result** (delta targets + DAgger, 8-round data): descent frac 0.80 → 0.91 (sign
+  supervision worked) but progress-vs-SGD 0.17 → 0.11 and ARI 0.71 → 0.67 (median
+  0.79 → 0.56). Diagnosis: **magnitude regression to the mean** — CE on digits prefers
+  the modal update, and 8-round data + diluted DAgger (~5 % mix) made the modal update
+  *smaller*. Delta fixed direction, not size.
+- **v5** (current): magnitude-targeted — `--delta-token-weight 3` (the `<DELTA>` digits
+  get 3× loss weight; the long trace otherwise soaks up the gradient), `--dup-early 3`
+  with 6-round data (big-update rounds dominate the target distribution), DAgger
+  corrections upsampled 3×, pre/post-DAgger evals built in — `scripts/train_v5.sh`.
+  Capacity variant: `MODEL=Qwen/Qwen2.5-1.5B LORA=1 GRADCKPT=1`. Not yet run.
 - `ntp/compare.py` shows any round's predicted vs true trace/params side by side.

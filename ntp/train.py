@@ -62,11 +62,13 @@ def tokenize_examples(examples: List[dict], tok: CharTokenizer) -> List[Tuple[Li
     return data
 
 
-def collate(batch: List[Tuple[List[int], int]], pad: int):
-    maxlen = max(len(ids) for ids, _ in batch)
+def collate(batch, pad: int):
+    """Items are (ids, prompt_len, ...) — extra fields (e.g. weight offsets) ignored."""
+    maxlen = max(len(item[0]) for item in batch)
     x = torch.full((len(batch), maxlen - 1), pad, dtype=torch.long)
     y = torch.full((len(batch), maxlen - 1), -100, dtype=torch.long)
-    for i, (ids, plen) in enumerate(batch):
+    for i, item in enumerate(batch):
+        ids, plen = item[0], item[1]
         n = len(ids)
         x[i, :n - 1] = torch.tensor(ids[:-1], dtype=torch.long)
         yy = torch.tensor(ids[1:], dtype=torch.long)
@@ -247,6 +249,9 @@ def main():
                     help="LoRA fine-tuning (recommended for models >=360M on a laptop)")
     ap.add_argument("--grad-ckpt", action="store_true",
                     help="gradient checkpointing (trade speed for memory)")
+    ap.add_argument("--delta-token-weight", type=float, default=1.0,
+                    help="HF backend: loss weight for the <DELTA>/<PARAMS> block tokens "
+                         "(magnitude digits); trace tokens keep weight 1.0")
     args = ap.parse_args()
 
     if args.backend == "scratch":

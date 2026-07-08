@@ -112,6 +112,10 @@ def main():
     ap.add_argument("--delta", action="store_true",
                     help="targets carry <DELTA> (signed param updates) instead of "
                          "absolute <PARAMS> — recommended; removes the copy-bias")
+    ap.add_argument("--dup-early", type=int, default=1,
+                    help="write rounds 0-1 examples this many times (train/val only): "
+                         "big-update rounds carry the magnitude signal the model "
+                         "otherwise regresses away")
     ap.add_argument("--no-wandb", action="store_true")
     args = ap.parse_args()
     jitter_sigmas = [float(s) for s in str(args.jitter_sigma).split(",") if s]
@@ -133,13 +137,16 @@ def main():
         gt_aris = []
         tasks_out = []
         jf = args.jitter_frac if split != "eval" else 0.0
+        dup = args.dup_early if split != "eval" else 1
         with open(os.path.join(args.out, split + ".jsonl"), "w") as f:
             for task, examples in gen_split(rng, n_tasks, args.rounds, cfg, split,
                                             use_compact, jf, jitter_sigmas, args.delta):
                 for ex in examples:
-                    f.write(json.dumps(ex) + "\n")
+                    reps = dup if ex["round"] <= 1 else 1
+                    for _ in range(reps):
+                        f.write(json.dumps(ex) + "\n")
+                        n_ex += 1
                     lens.append(len(ex["prompt"]) + len(ex["target"]))
-                    n_ex += 1
                 gt_aris.append(task["gt_final_ari"])
                 if split == "eval":
                     tasks_out.append(task)
