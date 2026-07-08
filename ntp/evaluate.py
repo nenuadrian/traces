@@ -67,6 +67,7 @@ def eval_task(task: dict, pred: dict) -> dict:
 
     # --- one-step fidelity (teacher-forced on the model's own state) ---
     loss_maes, assign_accs, assign_perm_accs, p_maes, copy_maes = [], [], [], [], []
+    descents, progresses = [], []
     for r in rounds:
         p_in = _params_from_text(r["params_in_text"], shapes, init)
         true_trace, true_out = run_round(code, p_in, shapes)
@@ -81,11 +82,22 @@ def eval_task(task: dict, pred: dict) -> dict:
         p_maes.append(mae(flatten_params(pred_out, shapes), flatten_params(true_out, shapes)))
         # baseline: emitting the input params unchanged ("no update")
         copy_maes.append(mae(flatten_params(p_in, shapes), flatten_params(true_out, shapes)))
+        # is the model's update a descent step on the true objective, and how much of
+        # real SGD's per-round progress does it capture? (1.0 = matches real SGD)
+        loss_in = tp["losses"][0]
+        loss_pred = loss_at(code, pred_out, shapes)
+        loss_true = loss_at(code, true_out, shapes)
+        descents.append(1.0 if loss_pred < loss_in - 1e-6 else 0.0)
+        denom = loss_in - loss_true
+        if denom > 1e-3:
+            progresses.append(max(-1.0, min(1.5, (loss_in - loss_pred) / denom)))
     m["onestep_loss_mae"] = mean([x for x in loss_maes if x == x])
     m["onestep_assign_acc"] = mean(assign_accs)
     m["onestep_assign_acc_perm"] = mean(assign_perm_accs)
     m["onestep_param_mae"] = mean(p_maes)
     m["copy_param_mae"] = mean(copy_maes)
+    m["onestep_descent_frac"] = mean(descents)
+    m["onestep_progress"] = mean(progresses) if progresses else float("nan")
 
     # --- open-loop drift vs the GT training run ---
     m["openloop_param_mae"] = []
@@ -102,9 +114,15 @@ def eval_task(task: dict, pred: dict) -> dict:
     m["selfcons_assign_acc"] = _acc(claimed, real_assign)
     m["selfcons_assign_acc_perm"] = _best_perm_acc(claimed, real_assign, task["k"])
 
-    # --- quality of the model-trained policy ---
+    # --- quality of the model-trained policy, per round (the LM's "training curve") ---
     labels = task["labels"]
     gt_final = _params_from_text(gt[-1]["params_out_text"], shapes, init)
+    m["ari_by_round"] = []
+    m["loss_by_round"] = []
+    for r in rounds:
+        p_r = _params_from_text(r["params_out_text"], shapes, init)
+        m["ari_by_round"].append(ari(cluster_at(code, p_r, shapes), labels))
+        m["loss_by_round"].append(loss_at(code, p_r, shapes))
     m["ari_init"] = ari(cluster_at(code, init, shapes), labels)
     m["ari_gt"] = ari(cluster_at(code, gt_final, shapes), labels)
     m["ari_model"] = ari(real_assign, labels)
@@ -158,6 +176,16 @@ def main():
         "onestep_assign_acc_perm": agg("onestep_assign_acc_perm"),
         "onestep_param_mae": agg("onestep_param_mae"),
         "copy_param_mae": agg("copy_param_mae"),
+        "onestep_descent_frac": agg("onestep_descent_frac"),
+        "onestep_progress": agg("onestep_progress"),
+        "ari_by_round": [
+            mean([t["ari_by_round"][r] for t in per_task
+                  if len(t["ari_by_round"]) > r])
+            for r in range(max(len(t["ari_by_round"]) for t in per_task))],
+        "loss_by_round": [
+            mean([t["loss_by_round"][r] for t in per_task
+                  if len(t["loss_by_round"]) > r])
+            for r in range(max(len(t["loss_by_round"]) for t in per_task))],
         "openloop_param_mae_by_round": [
             mean([t["openloop_param_mae"][r] for t in per_task
                   if len(t["openloop_param_mae"]) > r]) for r in range(n_rounds)],
@@ -180,8 +208,19 @@ def main():
           % (summary["onestep_assign_acc"], summary["onestep_assign_acc_perm"]))
     print("  param MAE:              %.4f  (copy-input baseline %.4f — beat this)"
           % (summary["onestep_param_mae"], summary["copy_param_mae"]))
+    print("  descent frac:           %.3f  (updates that reduce the true objective)"
+          % summary["onestep_descent_frac"])
+    print("  progress vs real SGD:   %.3f  (1.0 = full per-round progress)"
+          % summary["onestep_progress"])
     print("open-loop param MAE by round: %s"
           % " ".join("%.4f" % v for v in summary["openloop_param_mae_by_round"]))
+    print("model-trained policy by round (iterating the LM as the optimizer):")
+    print("  ARI:  init %.3f | %s   (GT-trained: %.3f)"
+          % (summary["ari_init"],
+             " ".join("%.3f" % v for v in summary["ari_by_round"]), summary["ari_gt"]))
+    print("  loss: init %.3f | %s   (GT-trained: %.3f)"
+          % (summary["loss_init"],
+             " ".join("%.3f" % v for v in summary["loss_by_round"]), summary["loss_gt"]))
     print("self-consistency (real run of code w/ model params vs model's claim):")
     print("  assign acc:             %.3f  (best-permutation %.3f)"
           % (summary["selfcons_assign_acc"], summary["selfcons_assign_acc_perm"]))

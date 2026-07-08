@@ -76,9 +76,9 @@ well-defined and iterable.
 # 1. safe plumbing check — CPU only, ~2 min, no downloads
 bash scripts/smoke_cpu.sh
 
-# 2. real run, current recipe (v2) — COMPUTE-HEAVY, meant for a CUDA machine
-bash scripts/train_v2.sh          # Qwen2.5-0.5B, 12k tasks, scratchpad traces
-# MODEL=HuggingFaceTB/SmolLM2-360M NAME=v2_smol360 bash scripts/train_v2.sh
+# 2. real run, current recipe (v3) — COMPUTE-HEAVY, meant for a CUDA machine
+bash scripts/train_v3.sh          # Qwen2.5-0.5B, jittered states, 6-round data, 10-round inference
+# MODEL=HuggingFaceTB/SmolLM2-360M NAME=v3_smol360 bash scripts/train_v3.sh
 
 # alternatives: v1 Mac-safe recipe / other variants (LoRA, gated Llama-3.2-1B, scratch)
 bash scripts/train_smol135.sh
@@ -113,7 +113,12 @@ Activity Monitor, and prefer `--lora --grad-ckpt` for anything ≥360M.
   assignments (acc, plus best-permutation acc to detect index-relabeling), and updated
   params (MAE). Pure simulation quality, no drift. The printed **copy-input baseline**
   is the param MAE of emitting no update — a model must beat it to be computing
-  anything.
+  anything. **descent frac** / **progress vs real SGD** measure whether the model's
+  update reduces the true objective and what fraction of real SGD's per-round progress
+  it captures (MAE can sit at the copy baseline while updates are still directionally
+  useful — these two disambiguate).
+- **model-trained policy by round** — the LM-as-optimizer's "training curve": ARI and
+  true objective of the policy after each iterated round, vs init and GT-trained.
 - **openloop_param_mae_by_round** — drift of the iterated model params vs the real
   training trajectory from the same init.
 - **selfcons_assign_acc** — the headline check: run the real code with the model's
@@ -155,7 +160,12 @@ Everything else (executor, serialization, training, inference, evaluation) is ge
   copy baseline ~0.13, model-trained ARI ≈ init. Diagnosis: no intermediate
   computation in the target (3 hidden SGD steps per round), digit-chunking BPE, and
   under-training.
-- **v2** (current, addresses all three): scratchpad traces (`w`/`c` per step),
-  Qwen2.5-0.5B default (single-digit tokenization), 12k tasks × ~3 epochs —
-  `scripts/train_v2.sh`. Not yet run.
+- **v2 result** (Qwen2.5-0.5B, 20k steps, scratchpad traces): first positive result —
+  the LM-trained policy improves the objective 2.98 → 1.84 and ARI 0.36 → 0.60,
+  closing ~45 % of the gap to real SGD (0.43 / 0.90). Remaining gap: updates are
+  directionally right but numerically sloppy (param MAE ≈ copy baseline), and open-loop
+  drift grows per round (model never saw off-trajectory states).
+- **v3** (current): jittered DAgger-style training states (`--jitter-frac`), 6-round
+  trajectories so near-converged states are in-distribution, 10 inference rounds
+  (rounds are Markov — iterating longer is free) — `scripts/train_v3.sh`. Not yet run.
 - `ntp/compare.py` shows any round's predicted vs true trace/params side by side.

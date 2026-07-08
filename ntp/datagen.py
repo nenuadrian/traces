@@ -17,20 +17,40 @@ import json
 import os
 import random
 
-from .executor import rollout
+from .executor import rollout, run_round
 from .metrics import ari, mean
 from .tasks import SamplerConfig, TaskSpec, render_code, sample_task
-from .textio import build_prompt, build_target, compact_code, parse_trace
+from .textio import (PARAM_KEYS, build_prompt, build_target, compact_code,
+                     params_to_text, parse_trace, quantize_params)
+
+
+def _jitter_params(params, shapes, rng: random.Random, sigma: float):
+    out = {}
+    for key in PARAM_KEYS:
+        v = params[key]
+        if len(shapes[key]) == 1:
+            out[key] = [x + rng.gauss(0.0, sigma) for x in v]
+        else:
+            out[key] = [[x + rng.gauss(0.0, sigma) for x in row] for row in v]
+    return quantize_params(out, shapes)
 
 
 def gen_split(rng: random.Random, n_tasks: int, rounds: int, cfg: SamplerConfig,
-              prefix: str, use_compact: bool):
-    """Yields (task_dict, examples) per task."""
+              prefix: str, use_compact: bool,
+              jitter_frac: float = 0.0, jitter_sigma: float = 0.08):
+    """Yields (task_dict, examples) per task.
+
+    jitter_frac > 0 adds DAgger-style examples: a round's input params are perturbed
+    with Gaussian noise and the round is re-executed from there, teaching the model to
+    descend from imperfect (i.e. its own, slightly-off) states, not only from exact
+    ground-truth trajectories.
+    """
     for i in range(n_tasks):
         spec = sample_task(rng, task_id="%s-%05d" % (prefix, i), cfg=cfg)
         code = render_code(spec)
         model_code = compact_code(code) if use_compact else code
-        recs = rollout(code, spec.init_params, spec.shapes(), rounds)
+        shapes = spec.shapes()
+        recs = rollout(code, spec.init_params, shapes, rounds)
         examples = []
         for r in recs:
             examples.append({
@@ -40,6 +60,17 @@ def gen_split(rng: random.Random, n_tasks: int, rounds: int, cfg: SamplerConfig,
                 "prompt": build_prompt(model_code, r["params_in_text"]),
                 "target": build_target(r["trace"], r["params_out_text"]),
             })
+        for r in recs:
+            if jitter_frac > 0.0 and rng.random() < jitter_frac:
+                jp = _jitter_params(r["params_in"], shapes, rng, jitter_sigma)
+                trace_j, out_j = run_round(code, jp, shapes)
+                examples.append({
+                    "task_id": spec.task_id,
+                    "round": r["round"], "jitter": True,
+                    "k": spec.k, "h": spec.h,
+                    "prompt": build_prompt(model_code, params_to_text(jp, shapes)),
+                    "target": build_target(trace_j, params_to_text(out_j, shapes)),
+                })
         task = spec.to_json()
         task["code"] = code
         task["model_code"] = model_code
@@ -63,6 +94,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--full-code", action="store_true",
                     help="feed the model the raw code (default: comment/blank-stripped)")
+    ap.add_argument("--jitter-frac", type=float, default=0.0,
+                    help="fraction of rounds to also emit from noise-perturbed params "
+                         "(train/val only; DAgger-style robustness to the model's own drift)")
+    ap.add_argument("--jitter-sigma", type=float, default=0.08)
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -77,8 +112,10 @@ def main():
         n_ex = 0
         gt_aris = []
         tasks_out = []
+        jf = args.jitter_frac if split != "eval" else 0.0
         with open(os.path.join(args.out, split + ".jsonl"), "w") as f:
-            for task, examples in gen_split(rng, n_tasks, args.rounds, cfg, split, use_compact):
+            for task, examples in gen_split(rng, n_tasks, args.rounds, cfg, split,
+                                            use_compact, jf, args.jitter_sigma):
                 for ex in examples:
                     f.write(json.dumps(ex) + "\n")
                     lens.append(len(ex["prompt"]) + len(ex["target"]))
