@@ -76,9 +76,9 @@ well-defined and iterable.
 # 1. safe plumbing check — CPU only, ~2 min, no downloads
 bash scripts/smoke_cpu.sh
 
-# 2. real run, current recipe (v3) — COMPUTE-HEAVY, meant for a CUDA machine
-bash scripts/train_v3.sh          # Qwen2.5-0.5B, jittered states, 6-round data, 10-round inference
-# MODEL=HuggingFaceTB/SmolLM2-360M NAME=v3_smol360 bash scripts/train_v3.sh
+# 2. real run, current recipe (v4) — COMPUTE-HEAVY, meant for a CUDA machine
+bash scripts/train_v4.sh          # delta targets + true DAgger + batched 12-round inference
+# MODEL=HuggingFaceTB/SmolLM2-360M NAME=v4_smol360 bash scripts/train_v4.sh
 
 # alternatives: v1 Mac-safe recipe / other variants (LoRA, gated Llama-3.2-1B, scratch)
 bash scripts/train_smol135.sh
@@ -103,6 +103,24 @@ model dir for HF).
 the machine (batch 8 × seq 2800 × fp32 attention once hit the ~20 GiB cap here). The
 scripts default to batch 2 with gradient accumulation; raise cautiously while watching
 Activity Monitor, and prefer `--lora --grad-ckpt` for anything ≥360M.
+
+## Experiment tracking (W&B)
+
+Every stage logs to Weights & Biases (project `$WANDB_PROJECT`, default
+`neural-trace-policies`), with all of an experiment's runs — datagen, train, dagger,
+infer, eval — sharing one **group** (e.g. `v4_qwen05`), so a whole `train_v4.sh`
+invocation reads as one experiment:
+
+- **train**: loss, val loss/token-acc, LR, grad norm, epoch, throughput, ETA; config
+  includes model size, dataset metadata (delta/jitter/rounds/seed), all CLI args.
+- **infer / dagger**: per-round format-ok rate and latency; dagger also logs the
+  distribution of objective values at model-visited states (drift signal).
+- **eval**: every summary metric, the per-round ARI/loss curves (x-axis = round, with
+  GT reference), a per-task table (sortable in the UI — find your worst tasks), and
+  ARI / progress histograms.
+
+`--no-wandb` on any command disables it; `WANDB_MODE=offline` queues locally. Init
+failures (no login etc.) print a warning and never interrupt a run.
 
 ## Metrics (`ntp/evaluate.py`)
 
@@ -137,6 +155,15 @@ Activity Monitor, and prefer `--lora --grad-ckpt` for anything ≥360M.
   and model output can be re-injected losslessly.
 - **Markov rounds.** Each example conditions only on (code, current params) — no
   optimizer state, no history — which is what makes output→input iteration valid.
+- **Delta targets (`datagen --delta`).** The target's parameter block is `<DELTA>`
+  (signed updates) instead of absolute `<PARAMS>`: with absolute targets most output
+  digits are copies of the prompt, which biases training toward timid near-copy updates
+  (v3's failure). Parse-repair degrades to a zero delta = "no update". `infer`/`dagger`
+  pick the mode up from the dataset metadata automatically.
+- **True DAgger (`ntp/dagger.py`).** Rolls the trained model on training tasks, executes
+  ground truth from the states *the model* visits (drift, plateaus and all), and emits
+  the corrections for a continuation fine-tune (`train --extra-train … --hf-model
+  runs/<prev>/hf_model`).
 - **Everything the model claims is checkable** by executing the code: traces are the
   program's real stdout, and the final parameters plug straight back into `cluster()`.
 - **Repo layout:** `ntp/` (tasks, textio, executor, metrics, datagen, calibrate,
@@ -165,7 +192,12 @@ Everything else (executor, serialization, training, inference, evaluation) is ge
   closing ~45 % of the gap to real SGD (0.43 / 0.90). Remaining gap: updates are
   directionally right but numerically sloppy (param MAE ≈ copy baseline), and open-loop
   drift grows per round (model never saw off-trajectory states).
-- **v3** (current): jittered DAgger-style training states (`--jitter-frac`), 6-round
-  trajectories so near-converged states are in-distribution, 10 inference rounds
-  (rounds are Markov — iterating longer is free) — `scripts/train_v3.sh`. Not yet run.
+- **v3 result** (+ jittered states, 6-round data, 10 inference rounds): ARI 0.60 → 0.71
+  (median 0.79), loss 1.84 → 1.45; ~62 % of the init→GT gap closed. New diagnostics
+  show the residual failure precisely: descent frac 0.80 but progress-vs-SGD 0.17 — a
+  *reliable but ~6×-too-timid* optimizer that nails the coarse-geometry phase (round-1
+  ARI jump) and plateaus in the confidence-sharpening phase.
+- **v4** (current): `<DELTA>` targets (kill the copy bias behind the timid updates),
+  true DAgger corrections at model-visited states, multi-scale jitter, 8-round data,
+  batched 12-round inference — `scripts/train_v4.sh` (two-phase). Not yet run.
 - `ntp/compare.py` shows any round's predicted vs true trace/params side by side.

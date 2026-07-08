@@ -25,6 +25,7 @@ from typing import List, Tuple
 import torch
 import torch.nn.functional as F
 
+from . import wb
 from .scratch_model import (CharTokenizer, MiniGPT, ModelConfig, pick_device,
                             save_checkpoint)
 
@@ -36,6 +37,15 @@ def load_examples(path: str) -> List[dict]:
             if line.strip():
                 out.append(json.loads(line))
     return out
+
+
+def load_train_examples(args) -> List[dict]:
+    ex = load_examples(os.path.join(args.data, "train.jsonl"))
+    for p in (getattr(args, "extra_train", None) or []):
+        extra = load_examples(p)
+        print("extra train: %s (+%d examples)" % (p, len(extra)), flush=True)
+        ex.extend(extra)
+    return ex
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +114,7 @@ def train_scratch(args):
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
 
-    train_ex = load_examples(os.path.join(args.data, "train.jsonl"))
+    train_ex = load_train_examples(args)
     val_ex = load_examples(os.path.join(args.data, "val.jsonl"))
     tok = CharTokenizer()
     train_data = tokenize_examples(train_ex, tok)
@@ -112,12 +122,24 @@ def train_scratch(args):
 
     max_len = max(len(ids) for ids, _ in train_data + val_data)
     ctx = min(args.ctx, ((max_len + 63) // 64) * 64)
+    n0 = len(train_data) + len(val_data)
+    train_data = [d for d in train_data if len(d[0]) <= ctx]
+    val_data = [d for d in val_data if len(d[0]) <= ctx]
+    dropped = n0 - len(train_data) - len(val_data)
+    if dropped:
+        print("WARNING: dropped %d examples longer than ctx=%d (raise --ctx)"
+              % (dropped, ctx), flush=True)
     cfg = ModelConfig(vocab_size=tok.vocab_size, d_model=args.d_model,
                       n_layer=args.n_layer, n_head=args.n_head,
                       max_len=ctx, dropout=args.dropout)
     model = MiniGPT(cfg).to(device)
     print("device=%s params=%.2fM ctx=%d train_ex=%d val_ex=%d max_seq=%d"
           % (device, model.num_params() / 1e6, ctx, len(train_data), len(val_data), max_len))
+
+    run = wb.init_run("train", wb.tag_from_out(args.out), dict(
+        vars(args), backend="scratch", device=device, n_params=model.num_params(),
+        ctx=ctx, train_examples=len(train_data), val_examples=len(val_data),
+        **wb.data_meta(args.data)), enabled=not args.no_wandb)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01,
                             betas=(0.9, 0.95))
@@ -150,7 +172,7 @@ def train_scratch(args):
             tok_count += x.numel()
             loss_acc += loss.item()
             loss_n += 1
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         lr = lr_at(step, args.lr, args.warmup, args.steps)
         for g in opt.param_groups:
             g["lr"] = lr
@@ -165,6 +187,11 @@ def train_scratch(args):
             print(json.dumps(msg), flush=True)
             log_f.write(json.dumps(msg) + "\n")
             log_f.flush()
+            wb.log(run, {"train/loss": loss_acc / max(1, loss_n), "train/lr": lr,
+                         "train/grad_norm": float(grad_norm),
+                         "train/tok_per_s": tok_count / dt,
+                         "train/epoch": step * args.batch_size * args.accum / len(train_data),
+                         "train/eta_min": msg["eta_min"]}, step=step)
             loss_acc, loss_n = 0.0, 0
 
         if step % args.val_every == 0 or step == args.steps:
@@ -177,9 +204,13 @@ def train_scratch(args):
                 best_val = vl
                 save_checkpoint(os.path.join(args.out, "best.pt"), model, step,
                                 {"val_loss": vl, "val_tok_acc": va, "backend": "scratch"})
+            wb.log(run, {"val/loss": vl, "val/tok_acc": va, "val/best_loss": best_val},
+                   step=step)
     save_checkpoint(os.path.join(args.out, "last.pt"), model, step,
                     {"backend": "scratch"})
     print("done. best val loss %.4f. checkpoints in %s" % (best_val, args.out))
+    wb.set_summary(run, {"best_val_loss": best_val})
+    wb.finish(run)
 
 
 def main():
@@ -187,6 +218,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", choices=["hf", "scratch"], default="hf")
     ap.add_argument("--data", required=True)
+    ap.add_argument("--extra-train", nargs="*", default=None,
+                    help="additional train jsonl files (e.g. DAgger corrections)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--batch-size", type=int, default=8)
@@ -197,12 +230,15 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--val-every", type=int, default=250)
+    ap.add_argument("--no-wandb", action="store_true",
+                    help="disable Weights & Biases logging (project: $WANDB_PROJECT, "
+                         "default 'neural-trace-policies')")
     # scratch model size
     ap.add_argument("--d-model", type=int, default=256)
     ap.add_argument("--n-layer", type=int, default=6)
     ap.add_argument("--n-head", type=int, default=8)
     ap.add_argument("--dropout", type=float, default=0.05)
-    ap.add_argument("--ctx", type=int, default=3072)
+    ap.add_argument("--ctx", type=int, default=3328)
     # hf backend
     ap.add_argument("--hf-model", default="HuggingFaceTB/SmolLM2-135M",
                     help="any HF causal LM id (Llama-family recommended)")

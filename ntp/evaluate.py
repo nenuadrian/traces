@@ -27,6 +27,7 @@ import itertools
 import json
 from typing import List
 
+from . import wb
 from .executor import cluster_at, loss_at, run_round
 from .metrics import ari, mae, mean, median
 from .textio import (flatten_params, parse_params_text, parse_trace, shapes_for)
@@ -140,6 +141,7 @@ def main():
     ap.add_argument("--oracle", action="store_true",
                     help="evaluate GT rollouts against themselves (harness sanity check)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--no-wandb", action="store_true")
     args = ap.parse_args()
 
     with open(args.tasks) as f:
@@ -235,6 +237,39 @@ def main():
         with open(args.out, "w") as f:
             json.dump({"summary": summary, "per_task": per_task}, f, indent=1)
         print("wrote %s" % args.out)
+
+    # --- wandb: scalars as summary, curves as series, per-task table + histograms ---
+    tag = "oracle" if args.oracle else wb.tag_from_out(args.rollouts)
+    run = wb.init_run("eval", tag, {"tasks": args.tasks, "rollouts": args.rollouts,
+                                    "oracle": args.oracle, "n_tasks": len(per_task)},
+                      enabled=not args.no_wandb)
+    scalars = {k: v for k, v in summary.items() if not isinstance(v, list)}
+    wb.set_summary(run, scalars)
+    wb.log(run, {"quality/" + k: v for k, v in scalars.items()
+                 if k.startswith(("ari_", "loss_"))})
+    n_r = len(summary["ari_by_round"])
+    for r in range(n_r):
+        data = {"round/ari_model": summary["ari_by_round"][r],
+                "round/loss_model": summary["loss_by_round"][r],
+                "round/ari_gt_final": summary["ari_gt"],
+                "round/loss_gt_final": summary["loss_gt"]}
+        if r < len(summary["openloop_param_mae_by_round"]):
+            data["round/openloop_param_mae"] = summary["openloop_param_mae_by_round"][r]
+        wb.log(run, data, step=r + 1)
+    cols = ["task_id", "k", "format_ok", "onestep_loss_mae", "onestep_assign_acc",
+            "onestep_param_mae", "copy_param_mae", "onestep_descent_frac",
+            "onestep_progress", "selfcons_assign_acc", "ari_init", "ari_gt",
+            "ari_model", "loss_init", "loss_gt", "loss_model"]
+    tbl = wb.table(cols, [[t["task_id"], tasks[t["task_id"]]["k"]] +
+                          [t[c] for c in cols[2:]] for t in per_task])
+    hist_ari = wb.histogram([t["ari_model"] for t in per_task])
+    hist_prog = wb.histogram([t["onestep_progress"] for t in per_task
+                              if t["onestep_progress"] == t["onestep_progress"]])
+    if tbl is not None:
+        wb.log(run, {"per_task": tbl})
+    if hist_ari is not None:
+        wb.log(run, {"dist/ari_model": hist_ari, "dist/onestep_progress": hist_prog})
+    wb.finish(run)
 
 
 if __name__ == "__main__":

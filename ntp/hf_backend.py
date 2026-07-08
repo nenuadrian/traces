@@ -19,6 +19,8 @@ from typing import List, Tuple
 import torch
 import torch.nn.functional as F
 
+from . import wb
+
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
@@ -65,7 +67,7 @@ def load_hf(model_id: str, device: str, lora: bool, grad_ckpt: bool):
 
 
 def train_hf(args):
-    from .train import collate, load_examples, lr_at, make_batches
+    from .train import collate, load_examples, load_train_examples, lr_at, make_batches
 
     device = _device(args.device)
     torch.manual_seed(args.seed)
@@ -75,11 +77,18 @@ def train_hf(args):
     n_param = sum(p.numel() for p in model.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    train_data = hf_tokenize(load_examples(os.path.join(args.data, "train.jsonl")), tok)
+    train_data = hf_tokenize(load_train_examples(args), tok)
     val_data = hf_tokenize(load_examples(os.path.join(args.data, "val.jsonl")), tok)
     print("device=%s model=%s params=%.0fM trainable=%.1fM train_ex=%d max_tok=%d"
           % (device, args.hf_model, n_param / 1e6, n_train / 1e6, len(train_data),
              max(len(i) for i, _ in train_data)), flush=True)
+
+    run = wb.init_run("train", wb.tag_from_out(args.out), dict(
+        vars(args), backend="hf", device=device, n_params=n_param,
+        n_trainable=n_train, train_examples=len(train_data),
+        val_examples=len(val_data),
+        max_tokens=max(len(i) for i, _ in train_data),
+        **wb.data_meta(args.data)), enabled=not args.no_wandb)
 
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                             lr=args.hf_lr, weight_decay=0.01)
@@ -110,7 +119,7 @@ def train_hf(args):
             (loss / args.accum).backward()
             loss_acc += loss.item()
             loss_n += 1
-        torch.nn.utils.clip_grad_norm_(
+        grad_norm = torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad], 1.0)
         lr = lr_at(step - 1, args.hf_lr, args.warmup, args.steps)
         for g in opt.param_groups:
@@ -126,6 +135,11 @@ def train_hf(args):
             print(json.dumps(msg), flush=True)
             log_f.write(json.dumps(msg) + "\n")
             log_f.flush()
+            wb.log(run, {"train/loss": loss_acc / max(1, loss_n), "train/lr": lr,
+                         "train/grad_norm": float(grad_norm),
+                         "train/sec_per_step": dt / step,
+                         "train/epoch": step * args.batch_size * args.accum / len(train_data),
+                         "train/eta_min": msg["eta_min"]}, step=step)
             loss_acc, loss_n = 0.0, 0
 
         if step % args.val_every == 0 or step == args.steps:
@@ -141,7 +155,11 @@ def train_hf(args):
                 with open(os.path.join(out_dir, "ntp_meta.json"), "w") as f:
                     json.dump({"backend": "hf", "hf_model": args.hf_model,
                                "lora": args.lora, "step": step, "val_loss": vl}, f)
+            wb.log(run, {"val/loss": vl, "val/tok_acc": va, "val/best_loss": best_val},
+                   step=step)
     print("done. best val loss %.4f -> %s" % (best_val, out_dir), flush=True)
+    wb.set_summary(run, {"best_val_loss": best_val})
+    wb.finish(run)
 
 
 @torch.no_grad()
@@ -182,13 +200,29 @@ class HFGenerator:
 
     @torch.no_grad()
     def generate(self, prompt: str, max_new: int, stop: str = "<END>") -> str:
-        ids = torch.tensor([_encode_prompt(self.tok, prompt)], device=self.device)
+        return self.generate_batch([prompt], max_new, stop)[0]
+
+    @torch.no_grad()
+    def generate_batch(self, prompts, max_new: int, stop: str = "<END>"):
+        """Greedy decode a batch of prompts (left-padded)."""
+        pad = self.tok.pad_token_id if self.tok.pad_token_id is not None \
+            else self.tok.eos_token_id
+        enc = [_encode_prompt(self.tok, p) for p in prompts]
+        width = max(len(e) for e in enc)
+        ids = torch.full((len(enc), width), pad, dtype=torch.long)
+        mask = torch.zeros((len(enc), width), dtype=torch.long)
+        for i, e in enumerate(enc):
+            ids[i, width - len(e):] = torch.tensor(e, dtype=torch.long)
+            mask[i, width - len(e):] = 1
+        ids, mask = ids.to(self.device), mask.to(self.device)
         out = self.model.generate(
-            input_ids=ids, attention_mask=torch.ones_like(ids),
+            input_ids=ids, attention_mask=mask,
             max_new_tokens=max_new, do_sample=False,
-            pad_token_id=self.tok.pad_token_id or self.tok.eos_token_id,
-            eos_token_id=self.tok.eos_token_id)
-        gen = self.tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
-        if stop in gen:
-            gen = gen.split(stop, 1)[0] + stop
-        return gen
+            pad_token_id=pad, eos_token_id=self.tok.eos_token_id)
+        gens = []
+        for i in range(len(enc)):
+            gen = self.tok.decode(out[i][width:], skip_special_tokens=True)
+            if stop in gen:
+                gen = gen.split(stop, 1)[0] + stop
+            gens.append(gen)
+        return gens

@@ -4,3 +4,6 @@ torch>=2.1
 # HF backend (default: fine-tune SmolLM2/Qwen/Llama variants)
 transformers>=4.40
 peft>=0.10        # only needed for --lora
+
+# experiment tracking (every stage logs; disable per-command with --no-wandb)
+wandb>=0.16

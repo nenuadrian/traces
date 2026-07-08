@@ -20,8 +20,15 @@ import random
 from .executor import rollout, run_round
 from .metrics import ari, mean
 from .tasks import SamplerConfig, TaskSpec, render_code, sample_task
-from .textio import (PARAM_KEYS, build_prompt, build_target, compact_code,
-                     params_to_text, parse_trace, quantize_params)
+from .textio import (PARAM_KEYS, build_prompt, build_target, build_target_delta,
+                     compact_code, delta_params, delta_to_text, params_to_text,
+                     parse_trace, quantize_params)
+
+
+def make_target(p_in, p_out, trace, shapes, delta_mode: bool) -> str:
+    if delta_mode:
+        return build_target_delta(trace, delta_to_text(delta_params(p_in, p_out, shapes), shapes))
+    return build_target(trace, params_to_text(p_out, shapes))
 
 
 def _jitter_params(params, shapes, rng: random.Random, sigma: float):
@@ -37,7 +44,7 @@ def _jitter_params(params, shapes, rng: random.Random, sigma: float):
 
 def gen_split(rng: random.Random, n_tasks: int, rounds: int, cfg: SamplerConfig,
               prefix: str, use_compact: bool,
-              jitter_frac: float = 0.0, jitter_sigma: float = 0.08):
+              jitter_frac: float = 0.0, jitter_sigmas=(0.08,), delta_mode: bool = False):
     """Yields (task_dict, examples) per task.
 
     jitter_frac > 0 adds DAgger-style examples: a round's input params are perturbed
@@ -58,18 +65,20 @@ def gen_split(rng: random.Random, n_tasks: int, rounds: int, cfg: SamplerConfig,
                 "round": r["round"],
                 "k": spec.k, "h": spec.h,
                 "prompt": build_prompt(model_code, r["params_in_text"]),
-                "target": build_target(r["trace"], r["params_out_text"]),
+                "target": make_target(r["params_in"], r["params_out"], r["trace"],
+                                      shapes, delta_mode),
             })
         for r in recs:
             if jitter_frac > 0.0 and rng.random() < jitter_frac:
-                jp = _jitter_params(r["params_in"], shapes, rng, jitter_sigma)
+                jp = _jitter_params(r["params_in"], shapes, rng,
+                                    rng.choice(list(jitter_sigmas)))
                 trace_j, out_j = run_round(code, jp, shapes)
                 examples.append({
                     "task_id": spec.task_id,
                     "round": r["round"], "jitter": True,
                     "k": spec.k, "h": spec.h,
                     "prompt": build_prompt(model_code, params_to_text(jp, shapes)),
-                    "target": build_target(trace_j, params_to_text(out_j, shapes)),
+                    "target": make_target(jp, out_j, trace_j, shapes, delta_mode),
                 })
         task = spec.to_json()
         task["code"] = code
@@ -97,8 +106,19 @@ def main():
     ap.add_argument("--jitter-frac", type=float, default=0.0,
                     help="fraction of rounds to also emit from noise-perturbed params "
                          "(train/val only; DAgger-style robustness to the model's own drift)")
-    ap.add_argument("--jitter-sigma", type=float, default=0.08)
+    ap.add_argument("--jitter-sigma", default="0.08",
+                    help="noise scale, or comma-separated scales sampled per example "
+                         "(e.g. '0.05,0.15,0.3')")
+    ap.add_argument("--delta", action="store_true",
+                    help="targets carry <DELTA> (signed param updates) instead of "
+                         "absolute <PARAMS> — recommended; removes the copy-bias")
+    ap.add_argument("--no-wandb", action="store_true")
     args = ap.parse_args()
+    jitter_sigmas = [float(s) for s in str(args.jitter_sigma).split(",") if s]
+
+    from . import wb
+    run = wb.init_run("datagen", wb.tag_from_out(args.out), vars(args),
+                      enabled=not args.no_wandb)
 
     os.makedirs(args.out, exist_ok=True)
     cfg = SamplerConfig()
@@ -115,7 +135,7 @@ def main():
         jf = args.jitter_frac if split != "eval" else 0.0
         with open(os.path.join(args.out, split + ".jsonl"), "w") as f:
             for task, examples in gen_split(rng, n_tasks, args.rounds, cfg, split,
-                                            use_compact, jf, args.jitter_sigma):
+                                            use_compact, jf, jitter_sigmas, args.delta):
                 for ex in examples:
                     f.write(json.dumps(ex) + "\n")
                     lens.append(len(ex["prompt"]) + len(ex["target"]))
@@ -125,18 +145,27 @@ def main():
                     tasks_out.append(task)
         if split == "eval":
             with open(os.path.join(args.out, "eval_tasks.json"), "w") as f:
-                json.dump({"rounds": args.rounds, "tasks": tasks_out}, f, indent=1)
+                json.dump({"rounds": args.rounds, "delta": args.delta,
+                           "tasks": tasks_out}, f, indent=1)
         print("%s: %d tasks, %d examples, GT final ARI mean %.3f (frac>=0.8: %.2f)"
               % (split, n_tasks, n_ex, mean(gt_aris),
                  sum(1 for a in gt_aris if a >= 0.8) / max(1, len(gt_aris))))
+        wb.set_summary(run, {split + "/tasks": n_tasks, split + "/examples": n_ex,
+                             split + "/gt_ari_mean": mean(gt_aris)})
+        h = wb.histogram(gt_aris)
+        if h is not None:
+            wb.log(run, {"dist/gt_final_ari_" + split: h})
 
     lens.sort()
     print("example char length: p50=%d p95=%d max=%d"
           % (lens[len(lens) // 2], lens[int(len(lens) * 0.95)], lens[-1]))
     meta = {"rounds": args.rounds, "seed": args.seed, "compact_code": use_compact,
-            "max_chars": lens[-1]}
+            "delta": args.delta, "jitter_frac": args.jitter_frac,
+            "jitter_sigmas": jitter_sigmas, "max_chars": lens[-1]}
     with open(os.path.join(args.out, "meta.json"), "w") as f:
         json.dump(meta, f, indent=1)
+    wb.set_summary(run, {"chars_p50": lens[len(lens) // 2], "chars_max": lens[-1]})
+    wb.finish(run)
 
 
 if __name__ == "__main__":

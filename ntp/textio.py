@@ -121,6 +121,67 @@ def parse_params_text(text: str, shapes: Shapes, fallback: Params) -> Tuple[Para
 
 
 # ---------------------------------------------------------------------------
+# Delta encoding: the target can carry the parameter *update* instead of the new
+# absolute values. Every digit then carries update information (an absolute-params
+# target is mostly a copy of the prompt, which biases training toward timid updates).
+# ---------------------------------------------------------------------------
+
+def fmt_signed(v: float, dp: int = PARAM_DP) -> str:
+    return ("%%+.%df" % dp) % qfloat(v, dp)
+
+
+def zeros_like_shapes(shapes: Shapes) -> Params:
+    out: Params = {}
+    for key in PARAM_KEYS:
+        shape = shapes[key]
+        if len(shape) == 1:
+            out[key] = [0.0] * shape[0]
+        else:
+            out[key] = [[0.0] * shape[1] for _ in range(shape[0])]
+    return out
+
+
+def delta_params(p_in: Params, p_out: Params, shapes: Shapes) -> Params:
+    """Elementwise quantized update p_out - p_in (exact in 3-decimal fixed point)."""
+    d: Params = {}
+    for key in PARAM_KEYS:
+        if len(shapes[key]) == 1:
+            d[key] = [qfloat(b - a) for a, b in zip(p_in[key], p_out[key])]
+        else:
+            d[key] = [[qfloat(b - a) for a, b in zip(ra, rb)]
+                      for ra, rb in zip(p_in[key], p_out[key])]
+    return d
+
+
+def apply_delta(p_in: Params, delta: Params, shapes: Shapes) -> Params:
+    out: Params = {}
+    for key in PARAM_KEYS:
+        if len(shapes[key]) == 1:
+            out[key] = [qfloat(a + b) for a, b in zip(p_in[key], delta[key])]
+        else:
+            out[key] = [[qfloat(a + b) for a, b in zip(ra, rb)]
+                        for ra, rb in zip(p_in[key], delta[key])]
+    return out
+
+
+def delta_to_text(delta: Params, shapes: Shapes) -> str:
+    lines = []
+    for key in PARAM_KEYS:
+        val = delta[key]
+        if len(shapes[key]) == 1:
+            body = " ".join(fmt_signed(v) for v in val)
+        else:
+            body = " / ".join(" ".join(fmt_signed(v) for v in row) for row in val)
+        lines.append("%s %s" % (key, body))
+    return "\n".join(lines)
+
+
+def parse_delta_text(text: str, shapes: Shapes) -> Tuple[Params, bool]:
+    """Missing/short entries repair to 0.0 (= no update for that entry)."""
+    return parse_params_text(text, shapes, zeros_like_shapes(shapes))
+
+
+# ---------------------------------------------------------------------------
 # Prompt / target format
 # ---------------------------------------------------------------------------
 
@@ -144,22 +205,32 @@ def build_target(trace: str, params_text: str) -> str:
     )
 
 
+def build_target_delta(trace: str, delta_text: str) -> str:
+    return (
+        "<TRACE>\n" + trace.strip() + "\n</TRACE>\n"
+        "<DELTA>\n" + delta_text.strip() + "\n</DELTA>\n"
+        + END_MARK
+    )
+
+
 TRACE_BLOCK_RE = re.compile(r"<TRACE>\n(.*?)</TRACE>", re.DOTALL)
 PARAMS_BLOCK_RE = re.compile(r"<PARAMS>\n(.*?)</PARAMS>", re.DOTALL)
+DELTA_BLOCK_RE = re.compile(r"<DELTA>\n(.*?)</DELTA>", re.DOTALL)
 
 
-def parse_output(gen: str) -> Tuple[str, str, bool]:
-    """Parse generated text into (trace, params_text, format_ok)."""
+def parse_output(gen: str, delta: bool = False) -> Tuple[str, str, bool]:
+    """Parse generated text into (trace, params_or_delta_text, format_ok)."""
     if END_MARK in gen:
         gen = gen.split(END_MARK, 1)[0]
+    mark, block_re = ("<DELTA>", DELTA_BLOCK_RE) if delta else ("<PARAMS>", PARAMS_BLOCK_RE)
     trace_m = TRACE_BLOCK_RE.search(gen)
-    params_m = PARAMS_BLOCK_RE.search(gen)
+    params_m = block_re.search(gen)
     trace = trace_m.group(1).strip() if trace_m else ""
     params_text = params_m.group(1).strip() if params_m else ""
     ok = trace_m is not None and params_m is not None
     if not params_m:
-        # last resort: take everything after the last <PARAMS> or the tail of the text
-        tail = gen.rsplit("<PARAMS>", 1)
+        # last resort: take everything after the last block marker, or nothing
+        tail = gen.rsplit(mark, 1)
         params_text = tail[1].strip() if len(tail) == 2 else ""
         ok = False
     return trace, params_text, ok
