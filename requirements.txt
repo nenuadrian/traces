@@ -1,0 +1,6 @@
+# Core (already present on this machine)
+torch>=2.1
+
+# HF backend (default: fine-tune SmolLM2/Qwen/Llama variants)
+transformers>=4.40
+peft>=0.10        # only needed for --lora
