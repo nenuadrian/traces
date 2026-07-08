@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 from typing import List
 
@@ -36,6 +37,24 @@ def _params_from_text(text: str, shapes, fallback):
     return p
 
 
+def _acc(pred: List[int], true: List[int]) -> float:
+    if not pred or len(pred) != len(true):
+        return 0.0
+    return sum(1 for a, b in zip(pred, true) if a == b) / len(true)
+
+
+def _best_perm_acc(pred: List[int], true: List[int], k: int) -> float:
+    """Accuracy under the best relabeling of predicted cluster indices — separates
+    'got the grouping, permuted the labels' from 'got the geometry wrong'."""
+    if not pred or len(pred) != len(true):
+        return 0.0
+    best = 0.0
+    for perm in itertools.permutations(range(k)):
+        acc = sum(1 for a, b in zip(pred, true) if a < k and perm[a] == b) / len(true)
+        best = max(best, acc)
+    return best
+
+
 def eval_task(task: dict, pred: dict) -> dict:
     shapes = shapes_for(task["k"], task["h"])
     code = task["code"]
@@ -47,7 +66,7 @@ def eval_task(task: dict, pred: dict) -> dict:
                                                         for r in rounds])}
 
     # --- one-step fidelity (teacher-forced on the model's own state) ---
-    loss_maes, assign_accs, p_maes = [], [], []
+    loss_maes, assign_accs, assign_perm_accs, p_maes, copy_maes = [], [], [], [], []
     for r in rounds:
         p_in = _params_from_text(r["params_in_text"], shapes, init)
         true_trace, true_out = run_round(code, p_in, shapes)
@@ -56,16 +75,17 @@ def eval_task(task: dict, pred: dict) -> dict:
             loss_maes.append(mae(pp["losses"], tp["losses"]))
         else:
             loss_maes.append(float("nan"))
-        if pp["assign"] and len(pp["assign"]) == len(tp["assign"]):
-            assign_accs.append(sum(1 for a, b in zip(pp["assign"], tp["assign"]) if a == b)
-                               / len(tp["assign"]))
-        else:
-            assign_accs.append(0.0)
+        assign_accs.append(_acc(pp["assign"], tp["assign"]))
+        assign_perm_accs.append(_best_perm_acc(pp["assign"], tp["assign"], task["k"]))
         pred_out = _params_from_text(r["params_out_text"], shapes, p_in)
         p_maes.append(mae(flatten_params(pred_out, shapes), flatten_params(true_out, shapes)))
+        # baseline: emitting the input params unchanged ("no update")
+        copy_maes.append(mae(flatten_params(p_in, shapes), flatten_params(true_out, shapes)))
     m["onestep_loss_mae"] = mean([x for x in loss_maes if x == x])
     m["onestep_assign_acc"] = mean(assign_accs)
+    m["onestep_assign_acc_perm"] = mean(assign_perm_accs)
     m["onestep_param_mae"] = mean(p_maes)
+    m["copy_param_mae"] = mean(copy_maes)
 
     # --- open-loop drift vs the GT training run ---
     m["openloop_param_mae"] = []
@@ -79,11 +99,8 @@ def eval_task(task: dict, pred: dict) -> dict:
     final_params = _params_from_text(pred["final_params_text"], shapes, init)
     real_assign = cluster_at(code, final_params, shapes)
     claimed = parse_trace(rounds[-1]["trace"])["assign"]
-    if claimed and len(claimed) == len(real_assign):
-        m["selfcons_assign_acc"] = sum(1 for a, b in zip(claimed, real_assign) if a == b) \
-            / len(real_assign)
-    else:
-        m["selfcons_assign_acc"] = 0.0
+    m["selfcons_assign_acc"] = _acc(claimed, real_assign)
+    m["selfcons_assign_acc_perm"] = _best_perm_acc(claimed, real_assign, task["k"])
 
     # --- quality of the model-trained policy ---
     labels = task["labels"]
@@ -138,11 +155,14 @@ def main():
         "format_ok": agg("format_ok"),
         "onestep_loss_mae": agg("onestep_loss_mae"),
         "onestep_assign_acc": agg("onestep_assign_acc"),
+        "onestep_assign_acc_perm": agg("onestep_assign_acc_perm"),
         "onestep_param_mae": agg("onestep_param_mae"),
+        "copy_param_mae": agg("copy_param_mae"),
         "openloop_param_mae_by_round": [
             mean([t["openloop_param_mae"][r] for t in per_task
                   if len(t["openloop_param_mae"]) > r]) for r in range(n_rounds)],
         "selfcons_assign_acc": agg("selfcons_assign_acc"),
+        "selfcons_assign_acc_perm": agg("selfcons_assign_acc_perm"),
         "ari_init": agg("ari_init"),
         "ari_gt": agg("ari_gt"),
         "ari_model": agg("ari_model"),
@@ -156,12 +176,15 @@ def main():
     print("format_ok:                %.3f" % summary["format_ok"])
     print("one-step fidelity (teacher-forced on model state):")
     print("  loss MAE:               %.4f" % summary["onestep_loss_mae"])
-    print("  assign acc:             %.3f" % summary["onestep_assign_acc"])
-    print("  param MAE:              %.4f" % summary["onestep_param_mae"])
+    print("  assign acc:             %.3f  (best-permutation %.3f)"
+          % (summary["onestep_assign_acc"], summary["onestep_assign_acc_perm"]))
+    print("  param MAE:              %.4f  (copy-input baseline %.4f — beat this)"
+          % (summary["onestep_param_mae"], summary["copy_param_mae"]))
     print("open-loop param MAE by round: %s"
           % " ".join("%.4f" % v for v in summary["openloop_param_mae_by_round"]))
     print("self-consistency (real run of code w/ model params vs model's claim):")
-    print("  assign acc:             %.3f" % summary["selfcons_assign_acc"])
+    print("  assign acc:             %.3f  (best-permutation %.3f)"
+          % (summary["selfcons_assign_acc"], summary["selfcons_assign_acc_perm"]))
     print("policy quality (objective + ARI vs true blob labels):")
     print("  loss:  init %.3f  ->  GT-trained %.3f  |  model-trained %.3f"
           % (summary["loss_init"], summary["loss_gt"], summary["loss_model"]))

@@ -65,6 +65,8 @@ def policy_round(params):
             params["W1"][j][0] -= LR*sum(GH[i][j]*DATA[i][0] for i in range(n))
             params["W1"][j][1] -= LR*sum(GH[i][j]*DATA[i][1] for i in range(n))
             params["b1"][j] -= LR*sum(GH[i][j] for i in range(n))
+        print("w " + " ".join("%.1f" % cw[k] for k in range(K)))
+        print("c " + " / ".join("%.3f %.3f" % C[k] for k in range(K)))
         print("step %d loss %.4f" % (step + 1, loss))
     a = cluster(params)
     print("assign " + "".join(str(v) for v in a))
