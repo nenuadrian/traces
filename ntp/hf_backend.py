@@ -64,13 +64,26 @@ def load_hf(model_id: str, device: str, lora: bool, grad_ckpt: bool):
     tok = AutoTokenizer.from_pretrained(model_id)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_id)
-    if lora:
+    if os.path.exists(os.path.join(model_id, "adapter_config.json")):
+        # Continuation from a LoRA checkpoint: resume the SAVED adapter as trainable.
+        # Loading the dir as a plain model + get_peft_model attaches a freshly
+        # initialized adapter instead — the continuation silently restarts from the
+        # base model (v5_qwen15_dagger post-mortem).
+        from peft import PeftConfig, PeftModel
+        base_id = PeftConfig.from_pretrained(model_id).base_model_name_or_path
+        base = AutoModelForCausalLM.from_pretrained(base_id)
+        model = PeftModel.from_pretrained(base, model_id, is_trainable=True)
+        lora = True
+        model.print_trainable_parameters()
+    elif lora:
         from peft import LoraConfig, get_peft_model
         lcfg = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
                           target_modules=LORA_TARGETS, task_type="CAUSAL_LM")
+        model = AutoModelForCausalLM.from_pretrained(model_id)
         model = get_peft_model(model, lcfg)
         model.print_trainable_parameters()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_id)
     if grad_ckpt:
         model.config.use_cache = False
         model.gradient_checkpointing_enable(

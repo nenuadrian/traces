@@ -76,10 +76,9 @@ well-defined and iterable.
 # 1. safe plumbing check — CPU only, ~2 min, no downloads
 bash scripts/smoke_cpu.sh
 
-# 2. real run, current recipe (v6) — COMPUTE-HEAVY, meant for a CUDA machine
-bash scripts/train_v6.sh          # gradient-in-trace (shows backprop) + all v5 wins
-# capacity test (zero new code, reuses data/v5): the most decisive next experiment
-# MODEL=Qwen/Qwen2.5-1.5B LORA=1 GRADCKPT=1 NAME=v5_qwen15 BS=4 ACCUM=2 bash scripts/train_v5.sh
+# 2. real run, current recipe (v6) — COMPUTE-HEAVY, meant for a CUDA machine.
+# The capacity test answered itself (see Status: 1.5B broke the plateau), so run v6 at 1.5B:
+MODEL=Qwen/Qwen2.5-1.5B LORA=1 GRADCKPT=1 NAME=v6_qwen15 BS=4 ACCUM=2 bash scripts/train_v6.sh
 
 # alternatives: v1 Mac-safe recipe / other variants (LoRA, gated Llama-3.2-1B, scratch)
 bash scripts/train_smol135.sh
@@ -180,9 +179,10 @@ Everything else (executor, serialization, training, inference, evaluation) is ge
 
 **Levers already explored** (each a data/target reformulation, all generic to the
 harness): scratchpad traces (v2/v3), off-trajectory jitter + DAgger (v3/v4), delta
-targets (v4), magnitude-weighted loss + round rebalance (v5), gradient-in-trace (v6).
-The open question is whether the ~60 %-of-gap plateau is capacity (test: bigger model,
-zero code) or requires more computation shown on the page (v6) — run both.
+targets (v4), magnitude-weighted loss + round rebalance (v5), gradient-in-trace (v6),
+model scale (v5 at Qwen2.5-1.5B — this one broke the 0.5B plateau; see Status). Open
+questions: does v6's shown computation stack on top of capacity, and does scale keep
+paying (3B)?
 
 ## Status
 
@@ -218,8 +218,23 @@ zero code) or requires more computation shown on the page (v6) — run both.
   update (`gW1`/`gb1`/`gW2`/`gb2`) before applying it, so the model computes backprop on
   the page and the net `<DELTA>` is the sum of numbers it already emitted (same
   "show the computation" lever as v1→v2). Dynamics identical to v5; trace ~40 % longer.
-  Keeps all v5 wins — `scripts/train_v6.sh`. Not yet run.
-- **Capacity test** (recommended in parallel): `MODEL=Qwen/Qwen2.5-1.5B LORA=1
-  GRADCKPT=1 NAME=v5_qwen15 BS=4 ACCUM=2 bash scripts/train_v5.sh` — zero new code,
-  reuses `data/v5`; the most decisive test of the "computation-limited" diagnosis.
+  Keeps all v5 wins — `scripts/train_v6.sh`. Not yet run — run it at 1.5B (see Quickstart).
+- **v5 capacity result** (Qwen2.5-1.5B, LoRA r16, same `data/v5` recipe — `runs/v5_qwen15`,
+  pre-DAgger): **capacity was the bottleneck.** One-step progress-vs-SGD 0.149 → **0.273**
+  (out of the 0.11–0.17 band), ARI 0.690 → **0.776 with median 1.00**, loss 1.68 → **1.12**
+  (~74 % of the init→GT gap vs ~53 % at 0.5B), perm-corrected self-consistency 0.59 →
+  **0.91**, format_ok 1.0 across all 12 rounds. The typical eval task is now solved
+  end-to-end; the mean is dragged by a tail of stuck tasks (see the per-task table in the
+  W&B eval run). Param MAE (0.174) still hugs the copy baseline (0.186) even here — small
+  textual steps, but effective ones.
+- **Post-mortem: `v5_qwen15_dagger` is invalid — two bugs, both fixed.** (1) `load_hf`
+  wrapped any checkpoint in a *fresh* `get_peft_model(...)`, so continuing from a LoRA
+  adapter dir silently restarted from the base model (phase-2 val re-descended the
+  from-scratch curve: 0.642 @ step 500 vs 0.451 at phase-1 end) — its eval measured a
+  10k-step undertrained model, not DAgger. Now resumes via
+  `PeftModel.from_pretrained(..., is_trainable=True)`; the 0.5B runs were full-FT and
+  unaffected. (2) `dagger.jsonl` was cached at the `$DATA` level, so the 1.5B phase 2
+  consumed corrections collected from the *0.5B's* visited states (off-policy); dagger
+  files are now per-model under `runs/<name>/`. The 1.5B DAgger phase needs a re-run;
+  expectations modest — at 0.5B DAgger was ≈ neutral (progress 0.149 → 0.159).
 - `ntp/compare.py` shows any round's predicted vs true trace/params side by side.

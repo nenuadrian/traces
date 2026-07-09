@@ -42,11 +42,14 @@ python3 -m ntp.infer --ckpt "runs/$NAME/hf_model" --tasks "$DATA/eval_tasks.json
 python3 -m ntp.evaluate --tasks "$DATA/eval_tasks.json" \
     --rollouts "runs/$NAME/rollouts.json" --out "runs/$NAME/metrics.json"
 
-# phase 2: DAgger corrections (upsampled 3x), continue training
-[ -f "$DATA/dagger.jsonl" ] || python3 -m ntp.dagger --ckpt "runs/$NAME/hf_model" \
-    --data "$DATA" --out "$DATA/dagger.jsonl" --tasks 1500 --rounds 6 --batch-size 16
+# phase 2: DAgger corrections (upsampled 3x), continue training.
+# Per-model file: corrections must come from THIS model's rollouts — a $DATA-level
+# cache once fed the 0.5B's visited states to the 1.5B run (off-policy, invalid).
+DAGGER=${DAGGER:-runs/$NAME/dagger.jsonl}
+[ -f "$DAGGER" ] || python3 -m ntp.dagger --ckpt "runs/$NAME/hf_model" \
+    --data "$DATA" --out "$DAGGER" --tasks 1500 --rounds 6 --batch-size 16
 python3 -m ntp.train --backend hf --hf-model "runs/$NAME/hf_model" --data "$DATA" \
-    --extra-train "$DATA/dagger.jsonl" "$DATA/dagger.jsonl" "$DATA/dagger.jsonl" \
+    --extra-train "$DAGGER" "$DAGGER" "$DAGGER" \
     --out "runs/${NAME}_dagger" --steps "$STEPS2" --batch-size "$BS" --accum "$ACCUM" \
     --hf-lr 5e-5 --warmup 100 --log-every 50 --val-every 500 \
     --delta-token-weight "$DTW" $EXTRA
