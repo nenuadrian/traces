@@ -74,6 +74,73 @@ def policy_round(params):
     return params
 '''
 
+# Gradient-trace variant: identical dynamics, but each step prints the per-parameter
+# update (-LR*grad) it is about to apply, as g-blocks, before applying it. The round's
+# net <DELTA> is then the sum of the printed updates — the model computes backprop on
+# the page instead of in-weights. (Trace is longer; use with the HF backend.)
+TEMPLATE_GRAD = '''import math
+
+K = {k}
+H = {h}
+LR = {lr}
+STEPS = {steps}
+
+DATA = [
+{data_rows}
+]
+
+def forward(params, pt):
+    x, y = pt
+    h = [math.tanh(params["W1"][j][0]*x + params["W1"][j][1]*y + params["b1"][j]) for j in range(H)]
+    z = [sum(params["W2"][k][j]*h[j] for j in range(H)) + params["b2"][k] for k in range(K)]
+    return h, z
+
+def softmax(z):
+    m = max(z)
+    e = [math.exp(v - m) for v in z]
+    s = sum(e)
+    return [v / s for v in e]
+
+def cluster(params):
+    return [max(range(K), key=lambda k: forward(params, pt)[1][k]) for pt in DATA]
+
+def policy_round(params):
+    n = len(DATA)
+    for step in range(STEPS):
+        HZ = [forward(params, pt) for pt in DATA]
+        P = [softmax(z) for h, z in HZ]
+        cw = [sum(p[k] for p in P) + 1e-9 for k in range(K)]
+        C = [(sum(p[k]*pt[0] for pt, p in zip(DATA, P))/cw[k], sum(p[k]*pt[1] for pt, p in zip(DATA, P))/cw[k]) for k in range(K)]
+        D = [[(pt[0]-C[k][0])**2 + (pt[1]-C[k][1])**2 for k in range(K)] for pt in DATA]
+        S = [sum(P[i][k]*D[i][k] for k in range(K)) for i in range(n)]
+        loss = sum(S) / n
+        GZ = [[P[i][k]*(D[i][k]-S[i])/n for k in range(K)] for i in range(n)]
+        GH = [[sum(GZ[i][k]*params["W2"][k][j] for k in range(K))*(1.0-HZ[i][0][j]**2) for j in range(H)] for i in range(n)]
+        uW2 = [[-LR*sum(GZ[i][k]*HZ[i][0][j] for i in range(n)) for j in range(H)] for k in range(K)]
+        ub2 = [-LR*sum(GZ[i][k] for i in range(n)) for k in range(K)]
+        uW1 = [[-LR*sum(GH[i][j]*DATA[i][0] for i in range(n)), -LR*sum(GH[i][j]*DATA[i][1] for i in range(n))] for j in range(H)]
+        ub1 = [-LR*sum(GH[i][j] for i in range(n)) for j in range(H)]
+        print("w " + " ".join("%.1f" % cw[k] for k in range(K)))
+        print("c " + " / ".join("%.3f %.3f" % C[k] for k in range(K)))
+        print("gW1 " + " / ".join("%+.3f %+.3f" % (uW1[j][0], uW1[j][1]) for j in range(H)))
+        print("gb1 " + " ".join("%+.3f" % v for v in ub1))
+        print("gW2 " + " / ".join(" ".join("%+.3f" % uW2[k][j] for j in range(H)) for k in range(K)))
+        print("gb2 " + " ".join("%+.3f" % v for v in ub2))
+        for k in range(K):
+            params["b2"][k] += ub2[k]
+            for j in range(H):
+                params["W2"][k][j] += uW2[k][j]
+        for j in range(H):
+            params["W1"][j][0] += uW1[j][0]
+            params["W1"][j][1] += uW1[j][1]
+            params["b1"][j] += ub1[j]
+        print("step %d loss %.4f" % (step + 1, loss))
+    a = cluster(params)
+    print("assign " + "".join(str(v) for v in a))
+    print("counts " + " ".join(str(a.count(k)) for k in range(K)))
+    return params
+'''
+
 
 @dataclass
 class TaskSpec:
@@ -85,6 +152,7 @@ class TaskSpec:
     data: List[Tuple[float, float]]
     labels: List[int]                  # generating blob id per point (never shown to model)
     init_params: Dict[str, list]
+    grad_trace: bool = False           # print per-step gradient updates in the trace
 
     def shapes(self):
         return shapes_for(self.k, self.h)
@@ -93,7 +161,7 @@ class TaskSpec:
         return {
             "task_id": self.task_id, "k": self.k, "h": self.h, "lr": self.lr,
             "steps": self.steps, "data": self.data, "labels": self.labels,
-            "init_params": self.init_params,
+            "init_params": self.init_params, "grad_trace": self.grad_trace,
         }
 
     @staticmethod
@@ -101,7 +169,7 @@ class TaskSpec:
         return TaskSpec(
             task_id=d["task_id"], k=d["k"], h=d["h"], lr=d["lr"], steps=d["steps"],
             data=[tuple(p) for p in d["data"]], labels=d["labels"],
-            init_params=d["init_params"],
+            init_params=d["init_params"], grad_trace=d.get("grad_trace", False),
         )
 
 
@@ -112,7 +180,8 @@ def render_code(spec: TaskSpec) -> str:
         rows.append("    " + " ".join(
             "(%s, %s)," % (("%%.%df" % DATA_DP) % p[0], ("%%.%df" % DATA_DP) % p[1])
             for p in chunk))
-    return TEMPLATE.format(
+    template = TEMPLATE_GRAD if spec.grad_trace else TEMPLATE
+    return template.format(
         k=spec.k, h=spec.h, lr=("%.2f" % spec.lr), steps=spec.steps,
         data_rows="\n".join(rows))
 
@@ -149,7 +218,8 @@ def _sample_centers(rng: random.Random, k: int, cfg: SamplerConfig) -> List[Tupl
             return cs
 
 
-def sample_task(rng: random.Random, task_id: str, cfg: SamplerConfig = SamplerConfig()) -> TaskSpec:
+def sample_task(rng: random.Random, task_id: str, cfg: SamplerConfig = SamplerConfig(),
+                grad_trace: bool = False) -> TaskSpec:
     k = rng.choice(cfg.k_choices)
     h = rng.choice(cfg.h_choices)
     steps = rng.choice(cfg.steps_choices)
@@ -180,4 +250,4 @@ def sample_task(rng: random.Random, task_id: str, cfg: SamplerConfig = SamplerCo
     }
     init = quantize_params(init, shapes)
     return TaskSpec(task_id=task_id, k=k, h=h, lr=lr, steps=steps,
-                    data=pts, labels=labels, init_params=init)
+                    data=pts, labels=labels, init_params=init, grad_trace=grad_trace)

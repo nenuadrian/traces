@@ -44,7 +44,8 @@ def _jitter_params(params, shapes, rng: random.Random, sigma: float):
 
 def gen_split(rng: random.Random, n_tasks: int, rounds: int, cfg: SamplerConfig,
               prefix: str, use_compact: bool,
-              jitter_frac: float = 0.0, jitter_sigmas=(0.08,), delta_mode: bool = False):
+              jitter_frac: float = 0.0, jitter_sigmas=(0.08,), delta_mode: bool = False,
+              grad_trace: bool = False):
     """Yields (task_dict, examples) per task.
 
     jitter_frac > 0 adds DAgger-style examples: a round's input params are perturbed
@@ -53,7 +54,8 @@ def gen_split(rng: random.Random, n_tasks: int, rounds: int, cfg: SamplerConfig,
     ground-truth trajectories.
     """
     for i in range(n_tasks):
-        spec = sample_task(rng, task_id="%s-%05d" % (prefix, i), cfg=cfg)
+        spec = sample_task(rng, task_id="%s-%05d" % (prefix, i), cfg=cfg,
+                           grad_trace=grad_trace)
         code = render_code(spec)
         model_code = compact_code(code) if use_compact else code
         shapes = spec.shapes()
@@ -116,6 +118,9 @@ def main():
                     help="write rounds 0-1 examples this many times (train/val only): "
                          "big-update rounds carry the magnitude signal the model "
                          "otherwise regresses away")
+    ap.add_argument("--grad-trace", action="store_true",
+                    help="policy prints per-step gradient updates (g-blocks) in the "
+                         "trace, so the net <DELTA> is the sum of shown numbers")
     ap.add_argument("--no-wandb", action="store_true")
     args = ap.parse_args()
     jitter_sigmas = [float(s) for s in str(args.jitter_sigma).split(",") if s]
@@ -140,7 +145,8 @@ def main():
         dup = args.dup_early if split != "eval" else 1
         with open(os.path.join(args.out, split + ".jsonl"), "w") as f:
             for task, examples in gen_split(rng, n_tasks, args.rounds, cfg, split,
-                                            use_compact, jf, jitter_sigmas, args.delta):
+                                            use_compact, jf, jitter_sigmas, args.delta,
+                                            args.grad_trace):
                 for ex in examples:
                     reps = dup if ex["round"] <= 1 else 1
                     for _ in range(reps):
@@ -167,7 +173,8 @@ def main():
     print("example char length: p50=%d p95=%d max=%d"
           % (lens[len(lens) // 2], lens[int(len(lens) * 0.95)], lens[-1]))
     meta = {"rounds": args.rounds, "seed": args.seed, "compact_code": use_compact,
-            "delta": args.delta, "jitter_frac": args.jitter_frac,
+            "delta": args.delta, "grad_trace": args.grad_trace,
+            "jitter_frac": args.jitter_frac,
             "jitter_sigmas": jitter_sigmas, "max_chars": lens[-1]}
     with open(os.path.join(args.out, "meta.json"), "w") as f:
         json.dump(meta, f, indent=1)

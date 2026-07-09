@@ -76,8 +76,9 @@ well-defined and iterable.
 # 1. safe plumbing check — CPU only, ~2 min, no downloads
 bash scripts/smoke_cpu.sh
 
-# 2. real run, current recipe (v5) — COMPUTE-HEAVY, meant for a CUDA machine
-bash scripts/train_v5.sh          # magnitude-weighted delta loss + rebalanced rounds + DAgger
+# 2. real run, current recipe (v6) — COMPUTE-HEAVY, meant for a CUDA machine
+bash scripts/train_v6.sh          # gradient-in-trace (shows backprop) + all v5 wins
+# capacity test (zero new code, reuses data/v5): the most decisive next experiment
 # MODEL=Qwen/Qwen2.5-1.5B LORA=1 GRADCKPT=1 NAME=v5_qwen15 BS=4 ACCUM=2 bash scripts/train_v5.sh
 
 # alternatives: v1 Mac-safe recipe / other variants (LoRA, gated Llama-3.2-1B, scratch)
@@ -177,6 +178,12 @@ deterministic pure Python, (b) defines `policy_round(params)` printing a trace a
 returning params, (c) defines `cluster(params)`-style inspection used for verification.
 Everything else (executor, serialization, training, inference, evaluation) is generic.
 
+**Levers already explored** (each a data/target reformulation, all generic to the
+harness): scratchpad traces (v2/v3), off-trajectory jitter + DAgger (v3/v4), delta
+targets (v4), magnitude-weighted loss + round rebalance (v5), gradient-in-trace (v6).
+The open question is whether the ~60 %-of-gap plateau is capacity (test: bigger model,
+zero code) or requires more computation shown on the page (v6) — run both.
+
 ## Status
 
 - Verified: task calibration, oracle evaluation (perfect scores), CPU smoke of the full
@@ -202,9 +209,17 @@ Everything else (executor, serialization, training, inference, evaluation) is ge
   0.79 → 0.56). Diagnosis: **magnitude regression to the mean** — CE on digits prefers
   the modal update, and 8-round data + diluted DAgger (~5 % mix) made the modal update
   *smaller*. Delta fixed direction, not size.
-- **v5** (current): magnitude-targeted — `--delta-token-weight 3` (the `<DELTA>` digits
-  get 3× loss weight; the long trace otherwise soaks up the gradient), `--dup-early 3`
-  with 6-round data (big-update rounds dominate the target distribution), DAgger
-  corrections upsampled 3×, pre/post-DAgger evals built in — `scripts/train_v5.sh`.
-  Capacity variant: `MODEL=Qwen/Qwen2.5-1.5B LORA=1 GRADCKPT=1`. Not yet run.
+- **v5 result** (magnitude-weighted loss + rebalance): recovered v4's regression
+  (progress 0.11 → 0.16, ARI 0.68 median 0.57, ~60 % gap) but **did not break the
+  plateau**: progress-vs-SGD is flat at ~0.11–0.17 across v3/v4/v5 despite three
+  different target encodings. Conclusion: the bottleneck is *computing* the update to
+  SGD precision, not encoding it — a capacity/task-framing limit, not a bias.
+- **v6** (current): **gradient-in-trace** — the policy prints each step's per-parameter
+  update (`gW1`/`gb1`/`gW2`/`gb2`) before applying it, so the model computes backprop on
+  the page and the net `<DELTA>` is the sum of numbers it already emitted (same
+  "show the computation" lever as v1→v2). Dynamics identical to v5; trace ~40 % longer.
+  Keeps all v5 wins — `scripts/train_v6.sh`. Not yet run.
+- **Capacity test** (recommended in parallel): `MODEL=Qwen/Qwen2.5-1.5B LORA=1
+  GRADCKPT=1 NAME=v5_qwen15 BS=4 ACCUM=2 bash scripts/train_v5.sh` — zero new code,
+  reuses `data/v5`; the most decisive test of the "computation-limited" diagnosis.
 - `ntp/compare.py` shows any round's predicted vs true trace/params side by side.
